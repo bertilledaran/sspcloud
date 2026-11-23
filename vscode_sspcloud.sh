@@ -1,187 +1,190 @@
-#!/bin/bash
-#
-# setup_venv.sh - Create a Python virtual environment with all project
-#                 dependencies including the GAMS Python API.
-#
-# Prerequisites:
-#   - GAMS 54.7 already installed (run ./install_gams.sh first if not)
-#   - Python 3.10+ available
-#
-# Usage:
-#   chmod +x setup_venv.sh
-#   ./setup_venv.sh
-#
-
+#!/usr/bin/env bash
+# SSP Cloud / Onyxia VS Code initialization.
+# Usage: bash vscode.sh OWNER/REPOSITORY S3_FOLDER
 set -euo pipefail
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-VENV_DIR=".venv"
-GAMS_VERSION="54.7"
-GAMS_INSTALL_DIR="${HOME}/gams547"
-GAMS_BIN_DIR="${GAMS_INSTALL_DIR}/gams54.7_linux_x64_64_sfx"
+FULL_NAME="${1:?Usage: $0 OWNER/REPOSITORY S3_FOLDER}"
+SERV_FOLD="${2:?Usage: $0 OWNER/REPOSITORY S3_FOLDER}"
+PROJ_NAME="${FULL_NAME##*/}"
+WORK_DIR="/home/onyxia/work/${PROJ_NAME}"
+REPO_URL="https://github.com/${FULL_NAME}.git"
 
-GAMS_PIP_VERSION="54.7"     # pip package 'gams' version matching GAMS 54.7
+step() { printf '\n========== %s ==========\n' "$1"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
 
-# ─── Step 1: Check prerequisites ─────────────────────────────────────────────
-echo "=============================================="
-echo "  Project Python Environment Setup"
-echo "=============================================="
-
-# Check Python
-PYTHON_BIN=""
-for candidate in python3.12 python3.11 python3.10 python3 python; do
-    if command -v "$candidate" &>/dev/null; then
-        ver=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-        major="${ver%%.*}"
-        minor="${ver##*.}"
-        if [ "$major" -ge 3 ] && [ "$minor" -ge 10 ]; then
-            PYTHON_BIN="$candidate"
-            break
-        fi
-    fi
-done
-
-if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: Python 3.10+ not found."
-    echo "  Install Python 3.10+ and try again."
+# --- CLONE PROJECT ---
+step 'Prepare workspace and clone repository'
+mkdir -p /home/onyxia/work
+# A token, if supplied, is used only for cloning (not echoed).
+if [ -n "${GIT_PERSONAL_ACCESS_TOKEN:-}" ]; then
+    REPO_URL="https://${GIT_PERSONAL_ACCESS_TOKEN}@github.com/${FULL_NAME}.git"
+fi
+if [ -d "${WORK_DIR}/.git" ]; then
+    echo "Existing repository found: ${WORK_DIR}; keeping it."
+elif [ -e "$WORK_DIR" ]; then
+    echo "ERROR: ${WORK_DIR} exists but is not a Git checkout." >&2
     exit 1
-fi
-
-echo ""
-echo "[1/5] Python: $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
-
-# Check that ensurepip is available (required by venv)
-if ! "$PYTHON_BIN" -m ensurepip --version &>/dev/null; then
-    echo ""
-    echo "  ensurepip is not available. Attempting to install python3-venv..."
-    if command -v apt-get &>/dev/null; then
-        PYTHON_VER_FULL=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-        PKG="python${PYTHON_VER_FULL}-venv"
-        if sudo apt-get install -y "$PKG" 2>/dev/null; then
-            echo "  Installed $PKG."
-        else
-            echo "  ERROR: Failed to install $PKG automatically."
-            echo "  Please run manually:  sudo apt install $PKG"
-            exit 1
-        fi
-    elif command -v dnf &>/dev/null; then
-        sudo dnf install -y python3-venv
-        echo "  Installed python3-venv."
-    elif command -v yum &>/dev/null; then
-        sudo yum install -y python3-venv
-        echo "  Installed python3-venv."
-    else
-        echo "  ERROR: ensurepip is not available and no known package manager found."
-        echo "  Install the python3-venv package for your system manually."
+else
+    git clone "$REPO_URL" "$WORK_DIR" || {
+        echo "ERROR: Git clone failed. Check repository access and Git credentials." >&2
         exit 1
+    }
+fi
+unset REPO_URL
+
+echo "Workspace available at: $WORK_DIR"
+
+# --- INSTALL TMUX ---
+step 'Install tmux'
+if ! command -v tmux >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        (sudo -n apt-get update && sudo -n apt-get install -y tmux) || warn "tmux installation failed; continuing."
+    else
+        warn 'Cannot install tmux: apt-get or passwordless sudo unavailable.'
     fi
+else
+    echo 'tmux is already installed.'
 fi
 
-# Check GAMS installation
-if [ ! -d "$GAMS_BIN_DIR" ]; then
-    echo ""
-    echo "WARNING: GAMS binary directory not found at:"
-    echo "  $GAMS_BIN_DIR"
-    echo ""
-    echo "  Run './install_gams.sh' first, or adjust GAMS_BIN_DIR in this script."
-    echo "  The GAMS Python API will be installed but may not work until GAMS is available."
-else
-    echo "[2/5] GAMS found at: $GAMS_BIN_DIR"
-fi
-
-# ─── Step 2: Create virtual environment ──────────────────────────────────────
-echo ""
-if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/activate" ]; then
-    echo "[3/5] Virtual environment already exists at $VENV_DIR. Activating it..."
-    source "$VENV_DIR/bin/activate"
-else
-    if [ -d "$VENV_DIR" ]; then
-        echo "[3/5] Existing $VENV_DIR found but incomplete. Removing and recreating..."
-        rm -rf "$VENV_DIR"
+# --- COPY PROJECT DATA / SUPPORT SCRIPTS FROM S3 ---
+step 'Copy S3 files'
+if command -v mc >/dev/null 2>&1; then
+    if ! mc cp -r "s3/${SERV_FOLD}/${PROJ_NAME}" /home/onyxia/work/; then
+        warn "S3 copy failed; continuing with repository files. Check whether installers/data are missing."
     fi
-    echo "[3/5] Creating virtual environment at $VENV_DIR..."
-    "$PYTHON_BIN" -m venv "$VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-    echo "  Virtual environment created."
+else
+    warn "mc is unavailable; skipping S3 copy."
 fi
+cd "$WORK_DIR"
 
-# ─── Step 3: Upgrade pip ─────────────────────────────────────────────────────
-echo ""
-echo "[4/5] Upgrading pip..."
-pip install --quiet --upgrade pip
+# Both setup scripts should be present at the repository root or copied there
+# from S3. The GAMS license must be next to install_gams.sh.
+GAMS_INSTALLER="${WORK_DIR}/install_gams.sh"
+VENV_INSTALLER="${WORK_DIR}/setup_venv.sh"
+GAMS_BIN_DIR="${HOME}/gams547/gams54.7_linux_x64_64_sfx"
 
-# ─── Step 4: Install Python dependencies ─────────────────────────────────────
-echo ""
-echo "  Installing project requirements from requirements.txt..."
-pip install --quiet -r requirements.txt
-echo "  Project requirements installed."
-
-echo ""
-echo "  Installing GAMS Python API (gams==${GAMS_PIP_VERSION})..."
-pip install --quiet "gamsapi==${GAMS_PIP_VERSION}"
-echo "  GAMS API installed."
-
-# ─── Step 5: Verify ──────────────────────────────────────────────────────────
-echo ""
-echo "=============================================="
-echo "  Verification"
-echo "=============================================="
-
-echo ""
-echo "  Python packages:"
-python -c "
-import importlib.metadata as md
-for pkg in ['gams', 'numpy', 'pandas', 'matplotlib', 'seaborn']:
-    try:
-        v = md.version(pkg)
-        print(f'    {pkg}=={v}')
-    except md.PackageNotFoundError:
-        print(f'    {pkg} NOT INSTALLED')
-"
-
-echo ""
+# --- INSTALL GAMS BEFORE THE PYTHON API ---
+step 'Install GAMS 54.7'
+if [ -f "$GAMS_INSTALLER" ]; then
+    if [ -x "${GAMS_BIN_DIR}/gams" ]; then
+        echo "GAMS already present at ${GAMS_BIN_DIR}; skipping reinstallation."
+    else
+        bash "$GAMS_INSTALLER"
+    fi
+else
+    warn "Missing ${GAMS_INSTALLER}; skipping GAMS installation."
+fi
 if [ -d "$GAMS_BIN_DIR" ]; then
-    # Add GAMS to PATH for this session
     export PATH="${GAMS_BIN_DIR}:$PATH"
-    
-    echo "  GAMS binary:"
-    if command -v gams &>/dev/null; then
-        echo "    gams: $(gams --version 2>&1 | head -1)"
-    else
-        echo "    WARNING: 'gams' not found on PATH despite directory existing."
-    fi
-    
-    if command -v gdxdump &>/dev/null; then
-        echo "    gdxdump: $(which gdxdump)"
-    else
-        echo "    WARNING: 'gdxdump' not found on PATH."
-    fi
-else
-    echo "  GAMS binary: NOT AVAILABLE (skipping verification)"
 fi
 
-# ─── Done ────────────────────────────────────────────────────────────────────
-echo ""
-echo "=============================================="
-echo "  Setup complete!"
-echo "=============================================="
-echo ""
-echo "  To use this environment in future sessions:"
-echo ""
-echo "    source ${VENV_DIR}/bin/activate"
-echo ""
-echo "  To also make GAMS tools (gdxdump, etc.) available:"
-echo ""
-echo "    export PATH=\"${GAMS_BIN_DIR}:\$PATH\""
-echo ""
-echo "  Or add both lines to your ~/.bashrc / ~/.zshrc for permanence."
-echo ""
-echo "  IMPORTANT: Before running GAMS models, make sure these"
-echo "  input files are available (e.g. in the Model/ directory):"
-echo ""
-echo "    - MACMAP_Inputs.gdx"
-echo "    - SCC.gdx"
-echo ""
-echo "  These are not tracked in git and must be loaded manually."
-echo ""
-echo "=============================================="
+# --- CREATE PYTHON VENV AND INSTALL PROJECT REQUIREMENTS + GAMS API ---
+step 'Set up Python virtual environment'
+if [ -f "$VENV_INSTALLER" ]; then
+    # setup_venv.sh uses relative .venv and requirements.txt paths.
+    if [ -f "${WORK_DIR}/requirements.txt" ]; then
+        (cd "$WORK_DIR" && bash "$VENV_INSTALLER")
+    else
+        warn 'requirements.txt is missing; setup_venv.sh requires this file.'
+    fi
+elif [ -f "${WORK_DIR}/pyproject.toml" ]; then
+    warn 'setup_venv.sh not found; falling back to existing uv project setup.'
+    (cd "$WORK_DIR" && uv sync --frozen --no-cache --link-mode copy)
+else
+    warn 'Neither setup_venv.sh nor pyproject.toml found; skipping Python setup.'
+fi
+
+# --- INSTALL REQUESTED R PACKAGES IN THE FIRST R LIBRARY ---
+step 'Install R packages'
+if command -v Rscript >/dev/null 2>&1; then
+    # Do not source the project's .Rprofile while preparing the base packages;
+    # an active renv bootstrap can otherwise interfere with package installation.
+    (cd /tmp && Rscript --vanilla - <<'RSCRIPT'
+repos <- "https://cloud.r-project.org"
+lib <- .libPaths()[1]
+packages <- c("renv", "readr", "dplyr", "tidyr", "tibble", "purrr")
+missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) {
+  install.packages(missing, lib = lib, repos = repos)
+}
+failed <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(failed)) stop("R packages not installed: ", paste(failed, collapse = ", "))
+cat("R packages available in library search path; first library:", lib, "\n")
+RSCRIPT
+    )
+else
+    warn 'Rscript not on PATH; skipping R package installation.'
+fi
+
+# --- VS CODE SETTINGS ---
+step 'Configure VS Code'
+SETTINGS_FILE="${HOME}/.local/share/code-server/User/settings.json"
+mkdir -p "$(dirname "$SETTINGS_FILE")"
+cat > "$SETTINGS_FILE" <<'SETTINGS'
+{
+  "workbench.panel.defaultLocation": "right",
+  "workbench.editor.openSideBySideDirection": "down",
+  "editor.rulers": [80, 100, 120],
+  "terminal.integrated.cursorStyle": "line",
+  "terminal.integrated.cursorBlinking": true,
+  "chat.extensionUnification.enabled": false,
+  "workbench.colorTheme": "Default Dark Modern",
+  "cSpell.enabled": false,
+  "r.sessionWatcher": true,
+  "r.session.useWebServer": true,
+  "r.session.watchGlobalEnvironment": true,
+  "r.session.objectLengthLimit": 100,
+  "r.session.objectTimeout": 10,
+  "r.session.levelOfObjectDetail": "Minimal",
+  "r.session.emulateRStudioAPI": false,
+  "r.session.data.rowLimit": 3000,
+  "r.session.data.pageSize": 200,
+  "r.rtermSendDelay": 4,
+  "r.lsp.diagnostics": false,
+  "flake8.enabled": false,
+  "[python]": {"editor.defaultFormatter": "charliermarsh.ruff"},
+  "security.workspace.trust.enabled": false,
+  "security.workspace.trust.startupPrompt": "never",
+  "terminal.integrated.inheritEnv": false,
+  "git.defaultCloneDirectory": "~/work",
+  "python.testing.pytestEnabled": true,
+  "redhat.telemetry.enabled": false,
+  "julia.symbolCacheDownload": true,
+  "julia.enableTelemetry": false,
+  "r.bracketedPaste": true,
+  "workbench.secondarySideBar.defaultVisibility": "hidden",
+  "workbench.welcomePage.experimentalOnboarding": false
+}
+SETTINGS
+chown onyxia:users "$SETTINGS_FILE" 2>/dev/null || warn 'Could not adjust VS Code settings ownership.'
+
+# --- EXTENSIONS ---
+step 'Install VS Code extensions'
+if command -v code-server >/dev/null 2>&1; then
+    code-server --install-extension oderwat.indent-rainbow || warn "indent-rainbow installation failed"
+    code-server --install-extension yzhang.markdown-all-in-one || warn "Markdown extension installation failed"
+    code-server --install-extension 3xpo.regionfolding || warn "regionfolding installation failed"
+else
+    warn "code-server not yet on PATH; skipping extension installation"
+fi
+
+# --- COPILOT ---
+step 'Install GitHub Copilot'
+if command -v code-server >/dev/null 2>&1; then
+copilotVersion='1.156.0'
+COPILOT_TMP="$(mktemp -d)"
+if curl -fL -q --retry 5 \
+    "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/GitHub/vsextensions/copilot/${copilotVersion}/vspackage" \
+    -o "${COPILOT_TMP}/copilot.vsix.gz" && \
+    gzip -d "${COPILOT_TMP}/copilot.vsix.gz"; then
+    code-server --install-extension "${COPILOT_TMP}/copilot.vsix" --force || warn 'Copilot extension installation failed.'
+else
+    warn 'Copilot extension download failed.'
+fi
+rm -rf "$COPILOT_TMP"
+else
+    warn "code-server unavailable; skipping Copilot"
+fi
+
+chown -R onyxia:users "$WORK_DIR" 2>/dev/null || warn 'Could not change project ownership.'
+echo "Initialization complete. Project ready in $WORK_DIR"

@@ -3,6 +3,14 @@
 # Usage: bash vscode.sh OWNER/REPOSITORY S3_FOLDER
 set -euo pipefail
 
+# Save startup output for diagnosing missing installations.
+LOG_FILE="${HOME}/sspcloud-init.log"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+printf '\n========== SSP Cloud initialization: %s ==========\n' "$(date -Is)"
+trap 'status=$?; if [ "$status" -ne 0 ]; then echo "Initialization failed (exit $status). Inspect $LOG_FILE" >&2; fi' EXIT
+
 FULL_NAME="${1:?Usage: $0 OWNER/REPOSITORY S3_FOLDER}"
 SERV_FOLD="${2:?Usage: $0 OWNER/REPOSITORY S3_FOLDER}"
 PROJ_NAME="${FULL_NAME##*/}"
@@ -20,7 +28,12 @@ if [ -n "${GIT_PERSONAL_ACCESS_TOKEN:-}" ]; then
     REPO_URL="https://${GIT_PERSONAL_ACCESS_TOKEN}@github.com/${FULL_NAME}.git"
 fi
 if [ -d "${WORK_DIR}/.git" ]; then
-    echo "Existing repository found: ${WORK_DIR}; keeping it."
+    echo "Existing repository found: ${WORK_DIR}; updating it with new GitHub commits."
+    # --ff-only never resets or overwrites unrelated local work.
+    git -C "$WORK_DIR" pull --ff-only || {
+        echo "ERROR: Cannot update the existing Git checkout. Check Git credentials and local changes." >&2
+        exit 1
+    }
 elif [ -e "$WORK_DIR" ]; then
     echo "ERROR: ${WORK_DIR} exists but is not a Git checkout." >&2
     exit 1
@@ -57,42 +70,55 @@ else
 fi
 cd "$WORK_DIR"
 
-# Both setup scripts should be present at the repository root or copied there
-# from S3. The GAMS license must be next to install_gams.sh.
+# Both installers are committed at the ROOT of land-use-coalition.
+# install_gams.sh looks for gamslice.txt alongside itself, or (depending on
+# its version) in ~/.gamslice. Keep private licenses out of public GitHub.
 GAMS_INSTALLER="${WORK_DIR}/install_gams.sh"
 VENV_INSTALLER="${WORK_DIR}/setup_venv.sh"
 GAMS_BIN_DIR="${HOME}/gams547/gams54.7_linux_x64_64_sfx"
 
+step 'Verify installer files'
+for installer in "$GAMS_INSTALLER" "$VENV_INSTALLER"; do
+    [ -f "$installer" ] || {
+        echo "ERROR: Missing $installer. Check that it was committed and pushed to the cloned branch." >&2
+        exit 1
+    }
+    bash -n "$installer" || {
+        echo "ERROR: Invalid Bash syntax in $installer" >&2
+        exit 1
+    }
+done
+[ -f "${WORK_DIR}/requirements.txt" ] || {
+    echo "ERROR: Missing ${WORK_DIR}/requirements.txt, required by setup_venv.sh." >&2
+    exit 1
+}
+
 # --- INSTALL GAMS BEFORE THE PYTHON API ---
 step 'Install GAMS 54.7'
-if [ -f "$GAMS_INSTALLER" ]; then
-    if [ -x "${GAMS_BIN_DIR}/gams" ]; then
-        echo "GAMS already present at ${GAMS_BIN_DIR}; skipping reinstallation."
-    else
-        bash "$GAMS_INSTALLER"
-    fi
+if [ -x "${GAMS_BIN_DIR}/gams" ]; then
+    echo "GAMS already installed at ${GAMS_BIN_DIR}; skipping reinstallation."
 else
-    warn "Missing ${GAMS_INSTALLER}; skipping GAMS installation."
+    (cd "$WORK_DIR" && bash "$GAMS_INSTALLER") || {
+        echo 'ERROR: GAMS installation failed. See ~/sspcloud-init.log.' >&2
+        exit 1
+    }
 fi
-if [ -d "$GAMS_BIN_DIR" ]; then
-    export PATH="${GAMS_BIN_DIR}:$PATH"
-fi
+[ -x "${GAMS_BIN_DIR}/gams" ] || {
+    echo "ERROR: GAMS executable still missing: ${GAMS_BIN_DIR}/gams" >&2
+    exit 1
+}
+export PATH="${GAMS_BIN_DIR}:$PATH"
 
 # --- CREATE PYTHON VENV AND INSTALL PROJECT REQUIREMENTS + GAMS API ---
 step 'Set up Python virtual environment'
-if [ -f "$VENV_INSTALLER" ]; then
-    # setup_venv.sh uses relative .venv and requirements.txt paths.
-    if [ -f "${WORK_DIR}/requirements.txt" ]; then
-        (cd "$WORK_DIR" && bash "$VENV_INSTALLER")
-    else
-        warn 'requirements.txt is missing; setup_venv.sh requires this file.'
-    fi
-elif [ -f "${WORK_DIR}/pyproject.toml" ]; then
-    warn 'setup_venv.sh not found; falling back to existing uv project setup.'
-    (cd "$WORK_DIR" && uv sync --frozen --no-cache --link-mode copy)
-else
-    warn 'Neither setup_venv.sh nor pyproject.toml found; skipping Python setup.'
-fi
+(cd "$WORK_DIR" && bash "$VENV_INSTALLER") || {
+    echo 'ERROR: Python environment setup failed. See ~/sspcloud-init.log.' >&2
+    exit 1
+}
+[ -x "${WORK_DIR}/.venv/bin/python" ] || {
+    echo "ERROR: Python virtual environment missing: ${WORK_DIR}/.venv/bin/python" >&2
+    exit 1
+}
 
 # --- INSTALL REQUESTED R PACKAGES IN THE FIRST R LIBRARY ---
 step 'Install R packages'
@@ -188,3 +214,5 @@ fi
 
 chown -R onyxia:users "$WORK_DIR" 2>/dev/null || warn 'Could not change project ownership.'
 echo "Initialization complete. Project ready in $WORK_DIR"
+
+# Quick checks: tmux -V ; test -x ~/gams547/gams54.7_linux_x64_64_sfx/gams ; test -x "$WORK_DIR/.venv/bin/python"
